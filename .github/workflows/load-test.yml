@@ -1,0 +1,288 @@
+name: PerPilot Load Testing Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      virtual_users:
+        description: 'Number of Virtual Users'
+        required: false
+        default: '10'
+      duration:
+        description: 'Test duration'
+        required: false
+        default: '5m'
+
+jobs:
+  target-application:
+    name: "01 - Target Application"
+    runs-on: ubuntu-latest
+    outputs:
+      target_url: ${{ steps.set-target.outputs.target_url }}
+    steps:
+      - name: Set Target Application
+        id: set-target
+        run: |
+          echo "target_url=https://jsonplaceholder.typicode.com" >> $GITHUB_OUTPUT
+          echo "=========================================="
+          echo " 01 TARGET APPLICATION"
+          echo "=========================================="
+          echo " URL: https://jsonplaceholder.typicode.com"
+          echo " Tool: k6"
+
+  nfr-gathering:
+    name: "02 - NFR Gathering"
+    runs-on: ubuntu-latest
+    needs: target-application
+    steps:
+      - name: Define NFRs
+        run: |
+          echo "=========================================="
+          echo " 02 NFR GATHERING"
+          echo "=========================================="
+          echo " P95 Response Time: <= 2000ms"
+          echo " Error Rate: <= 1%"
+          echo " Min Throughput: >= 100 req/s"
+
+  workload-design:
+    name: "03 - Workload Design"
+    runs-on: ubuntu-latest
+    needs: nfr-gathering
+    steps:
+      - name: Design Load Scenarios
+        run: |
+          echo "=========================================="
+          echo " 03 WORKLOAD DESIGN"
+          echo "=========================================="
+          echo " Scenario 1: Browse Posts - 50%"
+          echo " Scenario 2: User Journey - 30%"
+          echo " Scenario 3: CRUD Operations - 20%"
+          echo " Virtual Users: 10"
+          echo " Duration: 5 minutes"
+
+  script-generation:
+    name: "04 - Script Generation"
+    runs-on: ubuntu-latest
+    needs: workload-design
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate k6 Script
+        run: |
+          mkdir -p load-tests
+          cat > load-tests/load-test.js << 'EOF'
+import http from 'k6/http';
+import { check, sleep, group } from 'k6';
+import { Rate, Trend, Counter } from 'k6/metrics';
+const errorRate = new Rate('error_rate');
+const totalRequests = new Counter('total_requests');
+export const options = {
+  vus: 10,
+  duration: '5m',
+  thresholds: {
+    http_req_duration: ['p(95)<2000'],
+    http_req_failed: ['rate<0.01'],
+    error_rate: ['rate<0.01'],
+  },
+};
+const BASE_URL = 'https://jsonplaceholder.typicode.com';
+function browsePosts() {
+  group('Browse Posts', () => {
+    const postsRes = http.get(BASE_URL + '/posts');
+    totalRequests.add(1);
+    check(postsRes, { 'posts list 200': (r) => r.status === 200 }) || errorRate.add(1);
+    const postId = Math.floor(Math.random() * 100) + 1;
+    const postRes = http.get(BASE_URL + '/posts/' + postId);
+    totalRequests.add(1);
+    check(postRes, { 'single post 200': (r) => r.status === 200 }) || errorRate.add(1);
+    const commRes = http.get(BASE_URL + '/posts/' + postId + '/comments');
+    totalRequests.add(1);
+    check(commRes, { 'comments 200': (r) => r.status === 200 }) || errorRate.add(1);
+  });
+  sleep(Math.random() * 2 + 1);
+}
+function userJourney() {
+  group('User Journey', () => {
+    const usersRes = http.get(BASE_URL + '/users');
+    totalRequests.add(1);
+    check(usersRes, { 'users 200': (r) => r.status === 200 }) || errorRate.add(1);
+    const userId = Math.floor(Math.random() * 10) + 1;
+    const userPostsRes = http.get(BASE_URL + '/users/' + userId + '/posts');
+    totalRequests.add(1);
+    check(userPostsRes, { 'user posts 200': (r) => r.status === 200 }) || errorRate.add(1);
+    const todosRes = http.get(BASE_URL + '/users/' + userId + '/todos');
+    totalRequests.add(1);
+    check(todosRes, { 'todos 200': (r) => r.status === 200 }) || errorRate.add(1);
+  });
+  sleep(Math.random() * 3 + 1);
+}
+function crudOperations() {
+  group('CRUD Operations', () => {
+    const createRes = http.post(
+      BASE_URL + '/posts',
+      JSON.stringify({ title: 'Load Test Post', body: 'k6 test', userId: 1 }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    totalRequests.add(1);
+    check(createRes, { 'create 201': (r) => r.status === 201 }) || errorRate.add(1);
+    const updateRes = http.put(
+      BASE_URL + '/posts/1',
+      JSON.stringify({ id: 1, title: 'Updated', body: 'updated', userId: 1 }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    totalRequests.add(1);
+    check(updateRes, { 'update 200': (r) => r.status === 200 }) || errorRate.add(1);
+    const deleteRes = http.del(BASE_URL + '/posts/1');
+    totalRequests.add(1);
+    check(deleteRes, { 'delete 200': (r) => r.status === 200 }) || errorRate.add(1);
+  });
+  sleep(Math.random() * 2 + 1);
+}
+export default function () {
+  const rand = Math.random();
+  if (rand < 0.5) { browsePosts(); }
+  else if (rand < 0.8) { userJourney(); }
+  else { crudOperations(); }
+}
+export function setup() { console.log('PerPilot Load Test Starting - VUs: 10 | Duration: 5m'); }
+export function teardown() { console.log('PerPilot Load Test Complete'); }
+EOF
+          echo "Script generated successfully"
+
+      - name: Upload k6 Script
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-load-test-script
+          path: load-tests/load-test.js
+
+  load-test-execution:
+    name: "05 - Load Test Execution"
+    runs-on: ubuntu-latest
+    needs: script-generation
+    outputs:
+      test_result: ${{ steps.run-test.outputs.result }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download k6 Script
+        uses: actions/download-artifact@v4
+        with:
+          name: k6-load-test-script
+          path: load-tests/
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6 -y
+          k6 version
+
+      - name: Run k6 Load Test
+        id: run-test
+        run: |
+          VUS=${{ github.event.inputs.virtual_users || '10' }}
+          DURATION=${{ github.event.inputs.duration || '5m' }}
+          mkdir -p results
+          echo "=========================================="
+          echo " 05 LOAD TEST EXECUTION"
+          echo " VUs: ${VUS} | Duration: ${DURATION}"
+          echo "=========================================="
+          k6 run --vus ${VUS} --duration ${DURATION} --summary-export=results/k6-summary.json load-tests/load-test.js 2>&1 | tee results/k6-output.txt
+          if [ $? -eq 0 ]; then
+            echo "result=PASSED" >> $GITHUB_OUTPUT
+          else
+            echo "result=FAILED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results
+          path: results/
+
+  store-results:
+    name: "06 - Store Results to GitHub"
+    runs-on: ubuntu-latest
+    needs: load-test-execution
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Results
+        uses: actions/download-artifact@v4
+        with:
+          name: load-test-results
+          path: results/
+
+      - name: Publish Summary
+        if: always()
+        run: |
+          RESULT=${{ needs.load-test-execution.outputs.test_result }}
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+## PerPilot Load Test Pipeline Results
+
+| Stage | Status |
+|-------|--------|
+| 01 Target Application | Done |
+| 02 NFR Gathering | Done |
+| 03 Workload Design | Done |
+| 04 Script Generation | Done |
+| 05 Load Test Execution | ${RESULT} |
+| 06 Store Results | Done |
+
+| Parameter | Value |
+|-----------|-------|
+| Target | https://jsonplaceholder.typicode.com |
+| Virtual Users | 10 |
+| Duration | 5 minutes |
+| Tool | k6 |
+
+*PerPilot AI Load Testing Pipeline*
+EOF
+
+      - name: Store Gist
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const result = '${{ needs.load-test-execution.outputs.test_result }}';
+            const ts = new Date().toISOString();
+            try {
+              const gist = await github.rest.gists.create({
+                description: 'PerPilot Load Test - ' + ts,
+                public: false,
+                files: {
+                  'results.md': {
+                    content: [
+                      '# PerPilot Load Test Results',
+                      '- Timestamp: ' + ts,
+                      '- Result: ' + result,
+                      '- Target: https://jsonplaceholder.typicode.com',
+                      '- VUs: 10 | Duration: 5m',
+                    ].join('\n')
+                  }
+                }
+              });
+              console.log('Gist: ' + gist.data.html_url);
+            } catch(e) { console.log('Gist error: ' + e.message); }
+
+      - name: Complete
+        run: |
+          echo "=========================================="
+          echo " PERPILOT PIPELINE - COMPLETE"
+          echo "=========================================="
+          echo " 01 Target Application  : Done"
+          echo " 02 NFR Gathering       : Done"
+          echo " 03 Workload Design     : Done"
+          echo " 04 Script Generation   : Done"
+          echo " 05 Load Test Execution : Done"
+          echo " 06 Store Results       : Done"
+          echo "=========================================="
